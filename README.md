@@ -1,4 +1,4 @@
-# Ajuster les colonnes — widget Grist
+# Ajuster les colonnes - widget Grist
 
 *[English below](#english)*
 
