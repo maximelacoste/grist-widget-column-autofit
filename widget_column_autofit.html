@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Widget Grist « Ajuster les colonnes » — v1.0.0
+  Calcule une largeur adaptée au contenu pour chaque colonne d'une vue tableau
+  et l'écrit dans _grist_Views_section_field.width.
+  Aucune requête réseau : tout le calcul se fait dans le navigateur.
+  Accès requis : complet (lecture des métadonnées + écriture des largeurs).
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline' https://grist.numerique.gouv.fr; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Ajuster les colonnes</title>
+<!-- API servie par l'instance elle-même : pas de dépendance à un hôte tiers.
+     Pour une autre instance, remplacer le domaine ici ET dans la CSP ci-dessus. -->
+<script src="https://grist.numerique.gouv.fr/grist-plugin-api.js"></script>
+<style>
+  :root {
+    --texte: var(--grist-theme-text, #262633);
+    --texte-leger: var(--grist-theme-text-light, #5e5e6b);
+    --fond: var(--grist-theme-page-panels-main-panel-bg, var(--grist-theme-page-bg, #ffffff));
+    --fond-doux: var(--grist-theme-table-header-bg, #f7f7f7);
+    --bordure: var(--grist-theme-table-body-border, #d9d9d9);
+    --accent: #0f7b52;          /* vert Grist assombri : contraste AA sur blanc */
+    --accent-fond: #16b378;
+    --alerte: #b3261e;
+    --police: -apple-system, BlinkMacSystemFont, "Segoe UI", "Liberation Sans", Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font: 13px/1.45 var(--police);
+    color: var(--texte);
+    background: var(--fond);
+    display: flex; flex-direction: column;
+  }
+  header, .reglages, footer { padding: 10px 12px; }
+  header { border-bottom: 1px solid var(--bordure); }
+  label.bloc { display: block; font-weight: 600; margin-bottom: 4px; }
+  select, input[type="number"] {
+    font: inherit; color: inherit; background: var(--fond);
+    border: 1px solid var(--bordure); border-radius: 3px; padding: 4px 6px;
+  }
+  select { width: 100%; }
+  input[type="number"] { width: 5.5em; }
+  .reglages {
+    display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center;
+    background: var(--fond-doux); border-bottom: 1px solid var(--bordure);
+  }
+  .reglages label { display: inline-flex; gap: 6px; align-items: center; }
+  main { flex: 1; overflow: auto; padding: 4px 0; }
+  .vide { padding: 24px 12px; color: var(--texte-leger); }
+  ul.colonnes { list-style: none; margin: 0; padding: 0; }
+  li.colonne {
+    display: grid;
+    grid-template-columns: auto minmax(6em, 11em) 1fr auto;
+    gap: 10px; align-items: center;
+    padding: 5px 12px;
+  }
+  li.colonne:hover { background: var(--fond-doux); }
+  .nom { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chiffres { font-variant-numeric: tabular-nums; color: var(--texte-leger); white-space: nowrap; }
+  .chiffres b { color: var(--texte); font-weight: 600; }
+  .inchange .chiffres b { font-weight: 400; color: var(--texte-leger); }
+  /* La règle : trait = largeur actuelle, barre = largeur proposée */
+  .regle { position: relative; height: 14px; }
+  .regle .proposee {
+    position: absolute; left: 0; top: 3px; height: 8px;
+    background: var(--accent-fond); border-radius: 0 2px 2px 0;
+    transition: width .2s ease;
+  }
+  .regle .actuelle {
+    position: absolute; top: 0; height: 14px; width: 2px;
+    background: var(--texte); transition: left .2s ease;
+  }
+  .regle.plafonnee .proposee { background: repeating-linear-gradient(90deg, var(--accent-fond) 0 6px, transparent 6px 8px); }
+  footer {
+    border-top: 1px solid var(--bordure);
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  }
+  button {
+    font: inherit; border-radius: 3px; padding: 5px 12px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--fond); color: var(--accent);
+  }
+  button.principal { background: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible, select:focus-visible, input:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  #statut { flex: 1 1 100%; min-height: 1.45em; color: var(--texte-leger); }
+  #statut.erreur { color: var(--alerte); }
+  .version { margin-left: auto; color: var(--texte-leger); font-size: 11px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  @media (prefers-reduced-motion: reduce) { .regle * { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <label class="bloc" for="vue">Vue à ajuster</label>
+  <select id="vue" disabled><option>Chargement…</option></select>
+</header>
+
+<div class="reglages">
+  <label>Largeur min. <input type="number" id="min" min="30" max="1000" step="5" value="60"> px</label>
+  <label>max. <input type="number" id="max" min="30" max="2000" step="5" value="400"> px</label>
+  <label>D'après
+    <select id="mode" style="width:auto">
+      <option value="max">la valeur la plus longue</option>
+      <option value="p95">95 % des valeurs</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="entete" checked> Inclure les en-têtes</label>
+</div>
+
+<main>
+  <p class="vide" id="vide">Choisissez une vue pour voir les largeurs proposées.</p>
+  <ul class="colonnes" id="colonnes" aria-label="Colonnes de la vue"></ul>
+</main>
+
+<footer>
+  <button class="principal" id="appliquer" disabled>Appliquer</button>
+  <button id="annuler" disabled>Revenir aux largeurs précédentes</button>
+  <button id="defaut" disabled>Largeur par défaut</button>
+  <span class="version">v1.0.0</span>
+  <p id="statut" role="status" aria-live="polite"></p>
+</footer>
+
+<!-- ========== Logique pure (testable hors Grist) ========== -->
+<script id="logique">
+(function (g) {
+  'use strict';
+
+  const MARGE_CELLULE = 16;  // padding + bordure d'une cellule Grist
+  const MARGE_ENTETE = 34;   // padding + icône de menu de l'en-tête
+  const MARGE_PUCE = 16;     // padding d'une puce Choice / Ref
+  const ECART_PUCES = 4;
+
+  function lireJSON(s) {
+    if (!s) return {};
+    try { const o = JSON.parse(s); return o && typeof o === 'object' ? o : {}; }
+    catch (e) { return {}; }
+  }
+
+  function typeDeBase(t) { return String(t || 'Any').split(':')[0]; }
+  function fuseau(t) { const p = String(t || '').split(':'); return p[0] === 'DateTime' && p[1] ? p[1] : 'UTC'; }
+
+  function versLignes(tableColonnes) {
+    const ids = tableColonnes.id || [];
+    return ids.map(function (id, i) {
+      const r = {};
+      for (const k in tableColonnes) r[k] = tableColonnes[k][i];
+      return r;
+    });
+  }
+
+  // --- Dates : sous-ensemble des jetons moment.js utilisés par Grist ---
+  const JETONS = /\[[^\]]*\]|YYYY|YY|MMMM|MMM|MM|M|Do|DD|D|dddd|ddd|HH|H|hh|h|mm|ss|A|a/g;
+
+  function formaterDate(secondes, format, locale, tz) {
+    const d = new Date(secondes * 1000);
+    let p;
+    try {
+      p = {};
+      new Intl.DateTimeFormat('en-US', {
+        timeZone: tz, year: 'numeric', month: 'numeric', day: 'numeric',
+        hour: 'numeric', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+      }).formatToParts(d).forEach(function (x) { p[x.type] = x.value; });
+    } catch (e) { return d.toISOString(); }
+    const nom = function (opts) {
+      try { return new Intl.DateTimeFormat(locale, Object.assign({ timeZone: tz }, opts)).format(d); }
+      catch (e) { return ''; }
+    };
+    const pad = function (n) { return String(n).padStart(2, '0'); };
+    const H = Number(p.hour) % 24, h12 = H % 12 || 12;
+    return format.replace(JETONS, function (j) {
+      switch (j) {
+        case 'YYYY': return p.year;
+        case 'YY': return String(p.year).slice(-2);
+        case 'MMMM': return nom({ month: 'long' });
+        case 'MMM': return nom({ month: 'short' });
+        case 'MM': return pad(p.month);
+        case 'M': return String(Number(p.month));
+        case 'Do': return Number(p.day) + (String(locale).startsWith('fr') ? (p.day === '1' ? 'er' : '') : 'th');
+        case 'DD': return pad(p.day);
+        case 'D': return String(Number(p.day));
+        case 'dddd': return nom({ weekday: 'long' });
+        case 'ddd': return nom({ weekday: 'short' });
+        case 'HH': return pad(H);
+        case 'H': return String(H);
+        case 'hh': return pad(h12);
+        case 'h': return String(h12);
+        case 'mm': return p.minute;
+        case 'ss': return p.second;
+        case 'A': return H < 12 ? 'AM' : 'PM';
+        case 'a': return H < 12 ? 'am' : 'pm';
+        default: return j.slice(1, -1); // [texte littéral]
+      }
+    });
+  }
+
+  function formaterNombre(v, opts, locale, devise) {
+    if (typeof v !== 'number') return String(v);
+    if (opts.numMode === 'scientific') return v.toExponential(opts.decimals != null ? opts.decimals : undefined);
+    const o = {};
+    if (opts.numMode === 'currency') { o.style = 'currency'; o.currency = opts.currency || devise || 'EUR'; }
+    if (opts.numMode === 'percent') o.style = 'percent';
+    o.useGrouping = ['decimal', 'currency', 'percent'].indexOf(opts.numMode) >= 0;
+    if (opts.decimals != null) o.minimumFractionDigits = opts.decimals;
+    let maxi = opts.maxDecimals != null ? opts.maxDecimals : 10;
+    if (o.minimumFractionDigits != null && maxi < o.minimumFractionDigits) maxi = o.minimumFractionDigits;
+    if (opts.maxDecimals != null || opts.numMode !== 'currency') o.maximumFractionDigits = maxi;
+    try { return new Intl.NumberFormat(locale, o).format(v); }
+    catch (e) { return String(v); }
+  }
+
+  // Rendu d'une valeur : { genre: 'texte'|'puces'|'fixe', items: [...] } ou null (à ignorer)
+  function rendre(v, type, opts, ctx) {
+    const base = typeDeBase(type);
+    if (v === null || v === undefined || v === '') return { genre: 'texte', items: [''] };
+    if (Array.isArray(v) && v[0] === 'E') return { genre: 'texte', items: ['#' + (v[1] || 'Erreur')] };
+    if (base === 'Attachments') return null;
+    if (base === 'Bool') return { genre: 'fixe', items: [opts.widget === 'Switch' ? 32 : 16] };
+    if (Array.isArray(v) && v[0] === 'L') {
+      const items = v.slice(1).map(function (x) { return x == null ? '' : String(x); });
+      if (base === 'ChoiceList' || base === 'RefList') return { genre: 'puces', items: items };
+      return { genre: 'texte', items: [items.join(', ')] };
+    }
+    if (base === 'Choice') return { genre: 'puces', items: [String(v)] };
+    if (base === 'Numeric' || base === 'Int') return { genre: 'texte', items: [formaterNombre(v, opts, ctx.locale, ctx.devise)] };
+    if (base === 'Date' && typeof v === 'number') {
+      return { genre: 'texte', items: [formaterDate(v, opts.dateFormat || 'YYYY-MM-DD', ctx.locale, 'UTC')] };
+    }
+    if (base === 'DateTime' && typeof v === 'number') {
+      const f = (opts.dateFormat || 'YYYY-MM-DD') + ' ' + (opts.timeFormat || 'h:mma');
+      return { genre: 'texte', items: [formaterDate(v, f, ctx.locale, fuseau(type))] };
+    }
+    if (typeof v === 'object') return { genre: 'texte', items: [JSON.stringify(v)] };
+    // Texte : la ligne la plus longue compte
+    return { genre: 'texte', items: String(v).split('\n') };
+  }
+
+  function largeurRendu(r, mesurer) {
+    if (!r) return null;
+    if (r.genre === 'fixe') return r.items[0] + MARGE_CELLULE;
+    if (r.genre === 'puces') {
+      if (!r.items.length) return MARGE_CELLULE;
+      let somme = 0;
+      r.items.forEach(function (t) { somme += mesurer(t) + MARGE_PUCE; });
+      return somme + ECART_PUCES * (r.items.length - 1) + MARGE_CELLULE;
+    }
+    let maxi = 0;
+    r.items.forEach(function (t) { const w = mesurer(t); if (w > maxi) maxi = w; });
+    return maxi + MARGE_CELLULE;
+  }
+
+  function statistique(valeurs, mode) {
+    const v = valeurs.filter(function (x) { return x != null; }).sort(function (a, b) { return a - b; });
+    if (!v.length) return 0;
+    if (mode === 'p95') return v[Math.max(0, Math.ceil(v.length * 0.95) - 1)];
+    return v[v.length - 1];
+  }
+
+  // Renvoie { largeur, plafonnee }
+  function largeurProposee(p) {
+    let w = statistique(p.cellules, p.mode);
+    if (p.avecEntete) w = Math.max(w, p.entete);
+    w = Math.ceil(w / 5) * 5;
+    const plafonnee = w > p.max;
+    return { largeur: Math.min(p.max, Math.max(p.min, w)), plafonnee: plafonnee };
+  }
+
+  g.AjusterColonnes = {
+    MARGE_ENTETE: MARGE_ENTETE,
+    lireJSON: lireJSON, typeDeBase: typeDeBase, versLignes: versLignes,
+    formaterDate: formaterDate, formaterNombre: formaterNombre,
+    rendre: rendre, largeurRendu: largeurRendu,
+    statistique: statistique, largeurProposee: largeurProposee
+  };
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+
+<!-- ========== Interface et échanges avec Grist ========== -->
+<script>
+(function () {
+  'use strict';
+  if (typeof grist === 'undefined') {
+    document.getElementById('vide').textContent =
+      "L'API Grist n'a pas pu être chargée. Ce widget doit être ouvert depuis un document Grist.";
+    return;
+  }
+  const L = window.AjusterColonnes;
+  const $ = function (id) { return document.getElementById(id); };
+  const el = {
+    vue: $('vue'), min: $('min'), max: $('max'), mode: $('mode'), entete: $('entete'),
+    liste: $('colonnes'), vide: $('vide'), appliquer: $('appliquer'),
+    annuler: $('annuler'), defaut: $('defaut'), statut: $('statut')
+  };
+
+  const etat = {
+    meta: null, ctx: { locale: 'fr-FR', devise: 'EUR' },
+    section: null, champs: [], precedent: null, occupe: false
+  };
+
+  // --- Mesure du texte avec la police des cellules Grist ---
+  const canevas = document.createElement('canvas').getContext('2d');
+  const police = getComputedStyle(document.body).getPropertyValue('--police') ||
+    '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif';
+  canevas.font = '13px ' + police;
+  const cache = new Map();
+  function mesurer(t) {
+    let w = cache.get(t);
+    if (w === undefined) { w = canevas.measureText(t).width; cache.set(t, w); }
+    return w;
+  }
+
+  function statut(msg, erreur) {
+    el.statut.textContent = msg || '';
+    el.statut.classList.toggle('erreur', !!erreur);
+  }
+
+  function reglages() {
+    let min = Number(el.min.value) || 60, max = Number(el.max.value) || 400;
+    if (min > max) { const t = min; min = max; max = t; }
+    return { min: min, max: max, mode: el.mode.value, avecEntete: el.entete.checked };
+  }
+
+  // --- Métadonnées du document ---
+  async function chargerMeta() {
+    const noms = ['_grist_Views', '_grist_Pages', '_grist_Views_section',
+      '_grist_Views_section_field', '_grist_Tables', '_grist_Tables_column', '_grist_DocInfo'];
+    const t = await Promise.all(noms.map(function (n) { return grist.docApi.fetchTable(n); }));
+    const idx = function (lignes) { const m = new Map(); lignes.forEach(function (r) { m.set(r.id, r); }); return m; };
+    const meta = {
+      vues: idx(L.versLignes(t[0])),
+      pages: L.versLignes(t[1]).sort(function (a, b) { return a.pagePos - b.pagePos; }),
+      sections: idx(L.versLignes(t[2])),
+      champs: L.versLignes(t[3]),
+      tables: idx(L.versLignes(t[4])),
+      colonnes: idx(L.versLignes(t[5]))
+    };
+    const info = L.versLignes(t[6])[0] || {};
+    const reglagesDoc = L.lireJSON(info.documentSettings);
+    etat.ctx.locale = reglagesDoc.locale || 'fr-FR';
+    etat.ctx.devise = reglagesDoc.currency || 'EUR';
+    return meta;
+  }
+
+  function remplirVues(selection) {
+    const m = etat.meta;
+    el.vue.textContent = '';
+    const choix = document.createElement('option');
+    choix.value = ''; choix.textContent = '— Choisir une vue —';
+    el.vue.appendChild(choix);
+
+    const nomSection = function (s) {
+      const t = m.tables.get(s.tableRef);
+      return s.title || (t ? t.tableId : 'Tableau ' + s.id);
+    };
+    let total = 0;
+    m.pages.forEach(function (p) {
+      const vue = m.vues.get(p.viewRef);
+      if (!vue) return;
+      const secs = [];
+      m.sections.forEach(function (s) { if (s.parentId === vue.id && s.parentKey === 'record') secs.push(s); });
+      if (!secs.length) return;
+      const groupe = document.createElement('optgroup');
+      groupe.label = vue.name;
+      secs.forEach(function (s) {
+        const o = document.createElement('option');
+        o.value = String(s.id); o.textContent = nomSection(s);
+        groupe.appendChild(o); total++;
+      });
+      el.vue.appendChild(groupe);
+    });
+    const brutes = document.createElement('optgroup');
+    brutes.label = 'Données brutes';
+    m.tables.forEach(function (t) {
+      if (!t.rawViewSectionRef || /^GristHidden/.test(t.tableId)) return;
+      const o = document.createElement('option');
+      o.value = String(t.rawViewSectionRef); o.textContent = t.tableId;
+      brutes.appendChild(o); total++;
+    });
+    if (brutes.children.length) el.vue.appendChild(brutes);
+
+    el.vue.disabled = total === 0;
+    if (!total) { el.vide.textContent = 'Ce document ne contient aucune vue tableau.'; return; }
+    if (selection && m.sections.has(Number(selection))) el.vue.value = String(selection);
+  }
+
+  // --- Calcul pour une vue ---
+  async function analyserSection(sectionId) {
+    const m = etat.meta;
+    const section = m.sections.get(sectionId);
+    const table = section && m.tables.get(section.tableRef);
+    if (!section || !table) { etat.champs = []; afficher(); return; }
+    etat.section = section; etat.precedent = null;
+    statut('Lecture des données…');
+
+    const donnees = await grist.docApi.fetchTable(table.tableId);
+    const defaut = section.defaultWidth || 100;
+    const champs = m.champs
+      .filter(function (f) { return f.parentId === sectionId; })
+      .sort(function (a, b) { return a.parentPos - b.parentPos; });
+
+    etat.champs = champs.map(function (f) {
+      const col = m.colonnes.get(f.colRef);
+      if (!col || /^gristHelper_/.test(col.colId)) return null;
+      const opts = Object.assign({}, L.lireJSON(col.widgetOptions), L.lireJSON(f.widgetOptions));
+      const refAffichage = f.displayCol || col.displayCol;
+      const colAffichage = refAffichage ? m.colonnes.get(refAffichage) : null;
+      const valeurs = donnees[colAffichage ? colAffichage.colId : col.colId] || [];
+      let type = col.type, optsRendu = opts;
+      if (colAffichage && L.typeDeBase(col.type) === 'Ref') {
+        type = colAffichage.type; optsRendu = L.lireJSON(colAffichage.widgetOptions);
+      }
+      const cellules = [];
+      for (let i = 0; i < valeurs.length; i++) {
+        const w = L.largeurRendu(L.rendre(valeurs[i], type, optsRendu, etat.ctx), mesurer);
+        if (w != null) cellules.push(w);
+      }
+      const nom = col.label || col.colId;
+      return {
+        fieldId: f.id, nom: nom, actuelle: f.width || defaut,
+        cellules: cellules, ignoree: L.typeDeBase(col.type) === 'Attachments',
+        entete: mesurer(nom) + L.MARGE_ENTETE, coche: true
+      };
+    }).filter(Boolean);
+    etat.defaut = defaut;
+    recalculer();
+    statut(valeursResume(donnees));
+  }
+
+  function valeursResume(donnees) {
+    const n = (donnees.id || []).length;
+    return n + (n > 1 ? ' lignes analysées.' : ' ligne analysée.');
+  }
+
+  function recalculer() {
+    const r = reglages();
+    etat.champs.forEach(function (c) {
+      if (c.ignoree) { c.proposee = c.actuelle; c.plafonnee = false; return; }
+      const p = L.largeurProposee(Object.assign({ cellules: c.cellules, entete: c.entete }, r));
+      c.proposee = p.largeur; c.plafonnee = p.plafonnee;
+    });
+    afficher();
+  }
+
+  // --- Affichage ---
+  function afficher() {
+    el.liste.textContent = '';
+    el.vide.hidden = etat.champs.length > 0;
+    if (!etat.champs.length && etat.section) el.vide.textContent = 'Aucune colonne visible dans cette vue.';
+    const echelle = Math.max.apply(null, [1].concat(etat.champs.map(function (c) { return Math.max(c.actuelle, c.proposee); })));
+
+    etat.champs.forEach(function (c) {
+      const li = document.createElement('li');
+      li.className = 'colonne' + (c.proposee === c.actuelle ? ' inchange' : '');
+
+      const case_ = document.createElement('input');
+      case_.type = 'checkbox'; case_.checked = c.coche; case_.disabled = c.ignoree;
+      case_.setAttribute('aria-label', 'Ajuster « ' + c.nom + ' »');
+      case_.addEventListener('change', function () { c.coche = case_.checked; majBoutons(); });
+
+      const nom = document.createElement('span');
+      nom.className = 'nom'; nom.textContent = c.nom; nom.title = c.nom;
+
+      const regle = document.createElement('div');
+      regle.className = 'regle' + (c.plafonnee ? ' plafonnee' : '');
+      regle.setAttribute('aria-hidden', 'true');
+      const barre = document.createElement('span');
+      barre.className = 'proposee'; barre.style.width = (c.proposee / echelle * 100) + '%';
+      const trait = document.createElement('span');
+      trait.className = 'actuelle'; trait.style.left = 'calc(' + (c.actuelle / echelle * 100) + '% - 1px)';
+      regle.append(barre, trait);
+
+      const chiffres = document.createElement('span');
+      chiffres.className = 'chiffres';
+      if (c.ignoree) {
+        chiffres.textContent = 'pièces jointes, non modifiée';
+      } else {
+        chiffres.append(c.actuelle + ' → ');
+        const b = document.createElement('b'); b.textContent = c.proposee + ' px';
+        chiffres.append(b);
+        if (c.plafonnee) chiffres.append(' (plafonnée)');
+      }
+      li.append(case_, nom, regle, chiffres);
+      el.liste.appendChild(li);
+    });
+    majBoutons();
+  }
+
+  function aModifier() {
+    return etat.champs.filter(function (c) { return c.coche && !c.ignoree && c.proposee !== c.actuelle; });
+  }
+
+  function majBoutons() {
+    const n = aModifier().length;
+    el.appliquer.disabled = etat.occupe || n === 0;
+    el.appliquer.textContent = n ? 'Appliquer à ' + n + (n > 1 ? ' colonnes' : ' colonne') : 'Appliquer';
+    el.annuler.disabled = etat.occupe || !etat.precedent;
+    el.defaut.disabled = etat.occupe || !etat.champs.some(function (c) { return c.coche && !c.ignoree; });
+  }
+
+  // --- Écriture des largeurs ---
+  async function ecrire(largeurs, message) {
+    const ids = Object.keys(largeurs).map(Number);
+    if (!ids.length) return;
+    etat.occupe = true; majBoutons();
+    try {
+      await grist.docApi.applyUserActions([[
+        'BulkUpdateRecord', '_grist_Views_section_field', ids,
+        { width: ids.map(function (id) { return largeurs[id]; }) }
+      ]]);
+      etat.champs.forEach(function (c) {
+        if (c.fieldId in largeurs) c.actuelle = largeurs[c.fieldId] || etat.defaut;
+      });
+      statut(message);
+    } catch (e) {
+      statut("Écriture refusée : " + (e && e.message ? e.message : e) +
+        ". Vérifiez que le widget a l'accès complet et que vous pouvez modifier la structure du document.", true);
+    } finally {
+      etat.occupe = false; afficher();
+    }
+  }
+
+  function instantane(champs) {
+    const s = {};
+    champs.forEach(function (c) { s[c.fieldId] = c.actuelle === etat.defaut ? 0 : c.actuelle; });
+    return s;
+  }
+
+  el.appliquer.addEventListener('click', function () {
+    const cibles = aModifier();
+    etat.precedent = instantane(cibles);
+    const l = {};
+    cibles.forEach(function (c) { l[c.fieldId] = c.proposee; });
+    ecrire(l, cibles.length + (cibles.length > 1 ? ' colonnes ajustées.' : ' colonne ajustée.'));
+  });
+
+  el.annuler.addEventListener('click', function () {
+    const p = etat.precedent; etat.precedent = null;
+    ecrire(p, 'Largeurs précédentes rétablies.');
+  });
+
+  el.defaut.addEventListener('click', function () {
+    const cibles = etat.champs.filter(function (c) { return c.coche && !c.ignoree; });
+    etat.precedent = instantane(cibles);
+    const l = {};
+    cibles.forEach(function (c) { l[c.fieldId] = 0; });
+    ecrire(l, 'Largeur par défaut (' + etat.defaut + ' px) rétablie.');
+  });
+
+  // --- Réglages mémorisés dans les options du widget ---
+  function sauver() {
+    const r = reglages();
+    grist.setOptions({ sectionRef: Number(el.vue.value) || null, min: r.min, max: r.max, mode: r.mode, entete: r.avecEntete })
+      .catch(function () { /* lecteur seul : réglages non mémorisés */ });
+  }
+
+  [el.min, el.max, el.mode, el.entete].forEach(function (x) {
+    x.addEventListener('change', function () { recalculer(); sauver(); });
+  });
+  el.vue.addEventListener('change', function () {
+    sauver();
+    const id = Number(el.vue.value);
+    if (!id) { etat.section = null; etat.champs = []; afficher(); el.vide.textContent = 'Choisissez une vue pour voir les largeurs proposées.'; return; }
+    analyserSection(id).catch(function (e) { statut('Lecture impossible : ' + (e.message || e), true); });
+  });
+
+  // --- Démarrage ---
+  let demarre = false;
+  grist.ready({ requiredAccess: 'full' });
+  grist.onOptions(async function (options) {
+    if (demarre) return;
+    demarre = true;
+    options = options || {};
+    if (options.min) el.min.value = options.min;
+    if (options.max) el.max.value = options.max;
+    if (options.mode) el.mode.value = options.mode;
+    if (options.entete === false) el.entete.checked = false;
+    try {
+      etat.meta = await chargerMeta();
+      remplirVues(options.sectionRef);
+      if (el.vue.value) await analyserSection(Number(el.vue.value));
+    } catch (e) {
+      el.vue.textContent = '';
+      el.vide.textContent = "Le widget a besoin de l'accès complet au document " +
+        "(panneau de droite › Widget › Accès : « Accès complet »).";
+      statut(String(e && e.message ? e.message : e), true);
+    }
+  });
+})();
+</script>
+</body>
+</html>
